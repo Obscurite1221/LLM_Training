@@ -1,65 +1,86 @@
 import pandas
-import os
 import torch
-import sklearn
 import transformers
-from pandas import DataFrame
 import datasets
 from transformers import TrainingArguments
 import peft
-# Sentencepiece, protobuf
-max_seq_length = 8192
-dtype = None
-load_in_4bit = True
 
+
+### Load dataset and drop all the irrelevant data columns.
+### Uses Pandas dataframe and relevant library functions to do so.
 Dataset = datasets.Dataset
 
 dataset = pandas.read_csv("./Biomarker_dataset_2025_3_12.csv")
-#dataset.drop(axis="index")
 dataset.drop("RowId", axis="columns")
 dataset.drop("NCTId", axis="columns")
 dataset.drop("Current", axis="columns")
 dataset.drop("Link", axis="columns")
 dataset.drop("Field", axis="columns")
 
+# Drop all the empty or unfilled rows in the data
+# and split the data into the features and labels.
 dataset = dataset.dropna(subset=['Annotation'])
 dataset_Y = dataset.iloc[:,5]
 dataset_Y = dataset_Y.reset_index(drop=True)
 dataset_X = dataset.iloc[:,-2:]
 
+
+### Format the prompts according to what I determined was the most optimal training format for Llama 3.1 Instruct.
+### This can still likely be improved, and I highly doubt it's even fully correct as-is. The highly adaptive nature
+### of LLMs means that it's incredibly difficult to determine the true optimal format.
 temp_list = []
 for x in range(dataset_X.shape[0]):
-    temp_list.append(f"<|begin_of_text|>[INST] You are a helpful assistant specializing in medical text annotation. Your task is to analyze outcome measures and descriptions from clinical trials and predict the most medically significant biomarkers. Please list biomarkers in a comma-separated format and do not include any additional information except for the biomarkers.\n" +
-                     "The biomarkers should be labelled in a format as follows - SUPERGROUP_name. For example: CSF_p-tau, BLOOD_Aβ40, BLOOD_p-tau, UD_HbA1c, UD_IGF1, UD_T3, UD_IL-6, UD_TNF-α, URINE_F2-isoP, FDG-PET, fMRI, BLOOD_proteome, CSF_proteome. This list is not exhaustive, nor do all possibilities follow the exact convention listed. [/INST]\n" +
-                     f"Outcome Measure:\n{dataset_X['Outcome Measure']}\nOutcome Description:\n{dataset_X['Outcome Description']}\n")
+    # Note that some of these symbols are specified as special tokens in the associated tokenizer, however,
+    # some of the symbols are literally interpreted by the model in plaintext and are still part of the formatting.
+    # An example of this is <|begin_of_text|> vs [INST]. [INST] is a plaintext format called 'Alpaca', and it has no
+    # special entry in the token table. However, <|begin_of_text|> is listed as one of the initial tokens, and is a special token.
+    temp_list.append(f"<|begin_of_text|>[INST] <<SYS>>\n" +
+                     "You are a helpful assistant specializing in medical text annotation. Your task is to analyze the " +
+                     "provided outcome measure and outcome description from clinical trials and predict the most medically " +
+                     "significant biomarkers.\n" +
 
-#print(dataset_Y.index)
+                     "1) Output a comma-separated list of predicted biomarkers, using the format SUPERGROUP_name " +
+                     "(e.g., CSF_p-tau, BLOOD_Aβ40, FDG-PET). Do not include any additional commentary or explanation.\n" +
 
+                     "2) The biomarker list should follow the general format: SUPERGROUP_name. Example supergroups include " +
+                     "CSF, BLOOD, UD (undetermined), URINE, FDG-PET, fMRI, etc. This list is not exhaustive, and not all " +
+                     "terms must match the examples exactly.\n" +
+
+                     "3) If no specific biomarkers are clearly indicated, respond with a single word that best represents " +
+                     "the relevant biological domain (e.g., 'Metabolomics', 'Inflammation', 'Imaging').\n" +
+
+                     "4) If the outcome measure and description do not relate to any known biological processes or " +
+                     "biomarkers, respond with 'Unknown'.\n<</SYS>>" +
+
+                     f"\nOutcome Measure:\n{dataset_X['Outcome Measure']}\nOutcome Description:\n{dataset_X['Outcome Description']}\n[/INST]\n")
+
+
+### Format the label data. This is what the model is being trained to see as the 'correct' response.
 temp_list_2 = []
 for x in range(dataset_Y.shape[0]):
-    temp_list_2.append(temp_list[x] + dataset_Y[x] + '<|end_of_text|>')
+    ### This is a choice of whether to tell the model to reprint the original prompt AND the answer, or just the answer.
+    ### There are models trained using both methods.
+    #temp_list_2.append(temp_list[x] + dataset_Y[x] + '<|end_of_text|>')
+    temp_list_2.append(dataset_Y[x] + '<|end_of_text|>')
 
+### Convert the two lists into full dataframes using an inbuilt Pandas conversion function.
+### X is the prompts, Y is the labels.
 dataset_X = pandas.DataFrame(temp_list)
 dataset_Y = pandas.DataFrame(temp_list_2)
-df_concat = pandas.concat([dataset_X, dataset_Y], axis=1)
 
-#print(dataset_X)
+### Load the tokenizer and double confirm that the correct padding token is loaded into the tokenizer config.
 tokenizer = transformers.AutoTokenizer.from_pretrained('./Model')
 tokenizer.pad_token = tokenizer.eos_token
 
-#def tokenize_function_input(text):
-#    prompt = f"### Instruction: Please annotate the following clinical trial data using this example format:  CSF_p-tau, CSF_t-tau, BLOOD_Aβ40, BLOOD_Aβ42, BLOOD_p-tau\n### Input: {dataset_X['Outcome Measure']}\n{dataset_X['Outcome Description']}"
-#    return tokenizer(prompt, truncation=True, padding="max_length", max_length=512, return_tensors="pt")
-
-#def tokenize_function_output(text):
-#    prompt = dataset_Y['Annotation']
-
-#tokenized_dataset = df_concat.apply(tokenize_function, axis=1)
-#print(dataset_X)
-
+### Run the tokenizer on each prompt and save the tokenized datasets into new variables.
+### These now are formatted as ['input_id', 'attention_mask'] tensors.
+### The extra parameters assist in back-end prompt formatting, essentially zero-padding or truncating the prompt to match the max length.
 tokenized_dataset_X = dataset_X.map(lambda x: tokenizer(x, padding='max_length', truncation=True, max_length=512))
 tokenized_dataset_Y = dataset_Y.map(lambda x: tokenizer(x, padding='max_length', truncation=True, max_length=512))
 
+
+### This is a hack to format the data in a more friendly format.
+### It groups the prompt, attention mask, and label data into an easier format.
 TVal1 = []
 TVal2 = []
 TVal3 = []
@@ -68,162 +89,92 @@ for x in range(tokenized_dataset_X[0].shape[0]):
     TVal2.append(tokenized_dataset_X[0][x]['attention_mask'])
     TVal3.append(tokenized_dataset_Y[0][x]['input_ids'])
 
-#TVal1 = tokenized_dataset_X[0][0].ids
-#TVal2 = tokenized_dataset_X[0][0]['attention_mask']
-#TVal3 = tokenized_dataset_Y['Annotation'][:]['input_ids']
-
-#print(tokenized_dataset_Y)
-#print(dataset_Y)
-
-#tokenized_dataset_X_unpacked = [
-#    {"input_ids": entry["input_ids"], "attention_mask": entry["attention_mask"]}
-#    for entry in tokenized_dataset_X
-#]
-
-#tokenized_dataset_Y_unpacked = [
-#    {"input_ids": entry["input_ids"], "attention_mask": entry["attention_mask"]}
-#    for entry in tokenized_dataset_Y
-#]
-
-#tokenized_dataset_X_unpacked = datasets.Dataset.from_pandas(DataFrame(tokenized_dataset_X_unpacked))
-#tokenized_dataset_Y_unpacked = datasets.Dataset.from_pandas(DataFrame(tokenized_dataset_Y_unpacked))
-
-
-#labels = [
-#    {"labels": entry_Y["input_ids"] + [-100] * (512 - len(entry_Y["input_ids"]))}
-#    for  entry_Y in tokenized_dataset_Y_unpacked
-#]
-
-#tokenized_dataset_merged = {
-#    "input_ids": [entry_X["input_ids"] for entry_X in tokenized_dataset_X_unpacked],
-#    "attention_mask": [entry_X["attention_mask"] for entry_X in tokenized_dataset_X_unpacked],
-#    "labels": [label["labels"] for label in labels]
-#}
-
+### This iterates over the label values and sets the value for the <|end_of_text|> token to -100, which means
+### it will be ignored for cross-entropy loss evaluation.
 TVal3 = [
     [token if token != 128001 else -100 for token in seq]
     for seq in TVal3
 ]
 
+### Merge all three lists together for easy access, once again.
 merged_dataset = {
     'input_ids': TVal1,
     'attention_mask': TVal2,
     'labels': TVal3
 }
 
-#print(TVal3)
-#print(tokenizer.pad_token_id)
-#print(merged_dataset)
-#print(merged_dataset)
-#for x in range(len(tokenized_dataset_merged)):
-#    print(tokenized_dataset_merged["labels"])
-
-#tokenized_dataset_adjusted = []
-#for x in range(len(tokenized_dataset_merged["input_ids"])):
-#    tokenized_dataset_adjusted.append({
-#        "input_ids": torch.tensor(tokenized_dataset_merged["input_ids"][x], dtype=torch.long),
-#        "attention_mask": torch.tensor(tokenized_dataset_merged["attention_mask"][x], dtype=torch.long),
-#        "labels": torch.tensor(tokenized_dataset_merged["labels"][x], dtype=torch.long),
-#    })
-
-
-
-#for x in range(len(tokenized_dataset_adjusted)):
-#    print(len(tokenized_dataset_adjusted[x]["input_ids"]))
-#print(len(tokenized_dataset_adjusted[0]["input_ids"]))  # Should match len(labels)
-#print(len(tokenized_dataset_adjusted[0]["labels"]))
-
-#print(tokenized_dataset_merged)
-#print(len(tokenized_dataset_adjusted[0]))
-#print(len(tokenized_dataset_merged["input_ids"]), type(tokenized_dataset_merged["input_ids"]), len(tokenized_dataset_merged["attention_mask"]), type(tokenized_dataset_merged["attention_mask"]), len(tokenized_dataset_merged["labels"]), type(tokenized_dataset_merged["labels"]))
-#print(len(tokenized_dataset_merged["input_ids"][0]))
+### Run a conversion function using Huggingfaces Dataset library to convert from dict to Dataset type.
 tokenized_dataset_adjusted = Dataset.from_dict(merged_dataset)
 
+### Split the dataset into the train/test data.
 split_dataset = tokenized_dataset_adjusted.train_test_split(test_size=0.2, seed=3000)
-#train_loader = torch.utils.data.DataLoader(split_dataset['train'], batch_size=16, shuffle=True, collate_fn=data_collator)
-#test_loader = torch.utils.data.DataLoader(split_dataset['test'], batch_size=16, collate_fn=data_collator)
 
+### Label the variables appropriately and split it into a train and validation set.
 X_train = split_dataset['train']
 X_test = split_dataset['test']
-#X_train, X_test = sklearn.model_selection.train_test_split(tokenized_dataset_merged, train_size=0.80, test_size=0.20, random_state = 3000)
-
-#X_train = datasets.Dataset.from_pandas(DataFrame(X_train))
-#Y_train = datasets.Dataset.from_pandas(DataFrame(Y_train))
-#input_length_train = len(X_train["input_ids"])
-#labels_train = [-100] * input_length_train + Y_train["input_ids"]
-
-#X_test = datasets.Dataset.from_pandas(DataFrame(X_test))
-#Y_test = datasets.Dataset.from_pandas(DataFrame(Y_test))
-#input_length_test = len(X_test["input_ids"])
-#labels_test = [-100] * input_length_test + Y_test["input_ids"]
 
 
-
-#print(X_train)
-#torch.distributed.init_process_group(backend="nccl", rank=int(os.environ["SLURM_PROCID"]), world_size=7, init_method="env://")
-
-#model = torch.nn.DataParallel(model)
-#model = model.cuda()
-
-#print(model.forward)
-
-#model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[int(os.environ["SLURM_PROCID"])])
-#model, _, _, _ = deepspeed.initialize(model=model, config="./ds_config.json")
-
-#device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#model.to(device)
-
+### Define the Peft config settings for finetuning.
 config = peft.LoraConfig(
-    task_type=peft.TaskType.CAUSAL_LM,
-    inference_mode=False,
-    r=64,
-    lora_alpha=64,
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-    lora_dropout=0.1,
-    bias="none",
-    modules_to_save=["lm_head"],
+    task_type=peft.TaskType.CAUSAL_LM, # Model Type
+    inference_mode=False, # Whether it will be tested or just trained
+    r=64, # The number of ranks to train
+    lora_alpha=32, # The weight of the Peft layer
+    target_modules=["q_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"], # The parameters to train on each node
+    lora_dropout=0.1, # Same as usual ML dropout, prevents overfitting
+    bias="none", # Used for more advanced tuning and types of training.
+    modules_to_save=["lm_head"], # The part that actually holds the changes.
 )
 
+### Load the actual model from file. Since this is using a Llama 3.1 Instruct, it is considered AutoModelForCausalLM,
+### NOT LlamaForCasualLM! It may be possible to use LlamaForCasualLM with Llama 3.1, but I have not experimented with it.
+### As such, this code may not be compatible if this is changed.
 model = transformers.AutoModelForCausalLM.from_pretrained('./Model',local_files_only=True)
 
-#for name, param in model.named_parameters():
-#    print(name, param.size())
-#for name, module in model.named_modules():
-#    print(name)
-
+### Wrap the transformer model with the Peft adapter
 model = peft.get_peft_model(model, config)
 
+### Show that Peft is loaded and display what percentage of the model is being fine-tuned.
 model.print_trainable_parameters()
 
+### Data logging and analytics software. Also apparently helps with formatting issues, but I'm not 100% certain on that.
 data_collator = transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False)
 
+### All the important parameters for training the model.
 training_args = TrainingArguments(
-    output_dir="./Model_Output",
-    per_device_train_batch_size = 2,
-    per_device_eval_batch_size = 2,
-    gradient_checkpointing=True,
-    gradient_accumulation_steps=2,
-    weight_decay=0.0001,
-    learning_rate = 0.0003,
-    num_train_epochs = 10,
-    eval_strategy="steps",
-    eval_steps=15,
-    save_strategy="steps",
-    save_steps=60,
-    save_total_limit=2,
-    load_best_model_at_end=True,
-    logging_dir='./logs',
-    deepspeed="./ds_config.json",
+    output_dir="./Model_Output", # Save directory
+    per_device_train_batch_size = 2, # Per GPU batch, must match with Deepspeed config
+    per_device_eval_batch_size = 2, # Per GPU batch, must match with Deepspeed config
+    #gradient_checkpointing=True, # Useful for reducing the GPU load, but it's not fully configured right now.
+    gradient_accumulation_steps=2, # See above line
+    weight_decay=0.00001,  # The normalization to prevent exploding gradients. Keep it close to or smaller than the learning rate or things won't work well.
+    learning_rate = 0.00005, # The learning rate. Higher is faster, lower is better.
+    num_train_epochs = 50, # Number of passes over the dataset.
+    eval_strategy="steps", # Format for logging the training progress. It can be per-n-steps, or per-epoch.
+    eval_steps=100, # How often to evaluate performance.
+    save_strategy="steps", # Format for saving the model.
+    save_steps=100, # How often to save the model.
+    save_total_limit=3, # How many versions back you want to save.
+    load_best_model_at_end=True, # Save the best model recorded at the end. Can be buggy sometimes, if it tries to load a model that was already deleted.
+    logging_strategy="steps", # additional data logging every n steps.
+    logging_steps=100, # Interval of data logging. Not very performance degrading.
+    logging_dir='./logs', # Self explanatory.
+    deepspeed="./ds_config.json", # The location of the deepspeed config file. The params in the deepspeed MUST MATCH these params, or it WILL NOT RUN.
     #remove_unused_columns=False,
-    do_train=True,
-    do_eval=True,
-    lr_scheduler_type="cosine",
-    warmup_steps=15
+    do_train=True, # Tell it that it's going to train the model, it's not just loading it.
+    do_eval=True, # Tell it that it's going to test the model as well using a validation dataset.
+    lr_scheduler_type="cosine", # Very important to set correctly. Cosine approaches zero over time. There are multiple other types of schedulers.
+    warmup_steps=130, # Starts the fine-tuning off slow to prevent instability, ramps up over 130 steps, then begins lowering it as training progresses.
+    fp16=True # Use mixed precision to save on memory.
 )
 
 # lr_scheduler_type="cosine_with_restarts"
 
+### Note, as this is a proof of concept, it has no actual train/test/validate split. It only uses a train/test split, which may not be indicative of true performance.
+
+### Start training, save the model, then clear up all the parallel threats.
 trainer = transformers.trainer.Trainer(model, args=training_args, train_dataset=X_train, eval_dataset=X_test, data_collator=data_collator)
+#trainer.train(resume_from_checkpoint="./Model_Output/checkpoint-2580")
 trainer.train()
 trainer.save_model("./Model_Output/Final")
 tokenizer.save_pretrained("./Model_Output/Final")

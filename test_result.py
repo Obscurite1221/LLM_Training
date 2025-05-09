@@ -5,11 +5,15 @@ import torch
 import transformers
 import peft
 
-model = transformers.AutoModelForCausalLM.from_pretrained("./Model_Output/Final/")
+model = transformers.AutoModelForCausalLM.from_pretrained("./Model")
 lora_config = peft.LoraConfig.from_pretrained("./Model_Output/Final/")
 tokenizer = transformers.AutoTokenizer.from_pretrained("./Model_Output/Final/")
 model = peft.get_peft_model(model, lora_config)
 model = model.merge_and_unload()
+#model = model.to(torch.float16)
+print(hasattr(model, "peft_config"))
+model.save_pretrained("Llamed_3.1", safe_serialization=True)
+#tokenizer.save_pretrained("Llamed_3.1")
 
 num_gpus = torch.cuda.device_count()
 device = torch.device("cuda")
@@ -29,9 +33,45 @@ OM1_3 = "Exploratory Metabolomic Analysis"
 OM2_3 = "Change in metabolomics based on a global metabolomics exploratory panel from Baseline to Week 26."
 
 def format(val1, val2):
-    prompt1 = (f"<|begin_of_text|>[INST] You are a helpful assistant specializing in medical text annotation. Your task is to analyze outcome measures and descriptions from clinical trials and predict the most medically significant biomarkers. Please list biomarkers in a comma-separated format and do not include any additional information except for the biomarkers.\n" +
-                     "The biomarkers should be labelled in a format as follows - SUPERGROUP_name. For example: CSF_p-tau, BLOOD_Aβ40, BLOOD_p-tau, UD_HbA1c, UD_IGF1, UD_T3, UD_IL-6, UD_TNF-α, URINE_F2-isoP, FDG-PET, fMRI, BLOOD_proteome, CSF_proteome. This list is not exhaustive, nor do all possibilities follow the exact convention listed. [/INST]\n" +
-                     f"Outcome Measure:\n{val1}\nOutcome Description:\n{val2}\n")
+    #prompt1 = ( f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n" +
+    #            "You are a helpful assistant specializing in medical text annotation. Your task is to analyze the " +
+    #            "provided outcome measure and outcome description from clinical trials and predict the most medically " +
+    #            "significant biomarkers.\n" +
+
+    #            "1) Output a comma-separated list of predicted biomarkers, using the format SUPERGROUP_name " +
+    #            "(e.g., CSF_p-tau, BLOOD_Aβ40, FDG-PET). Do not include any additional commentary or explanation.\n" +
+
+    #            "2) The biomarker list should follow the general format: SUPERGROUP_name. Example supergroups include " +
+    #            "CSF, BLOOD, UD (undetermined), URINE, FDG-PET, fMRI, etc. This list is not exhaustive, and not all " +
+    #            "terms must match the examples exactly.\n" +
+
+    #            "3) If no specific biomarkers are clearly indicated, respond with a single word that best represents " +
+    #            "the relevant biological domain (e.g., 'Metabolomics', 'Inflammation', 'Imaging').\n" +
+
+    #            "4) If the outcome measure and description do not relate to any known biological processes or " +
+    #            "biomarkers, respond with 'Unknown'.\n" +
+
+    #            f"<|eot_id|><|start_header_id|>user<|end_header_id|>\nOutcome Measure:\n{val1}\nOutcome Description:\n{val2}\n<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n")
+    prompt1 = (f"<|begin_of_text|>[INST] <<SYS>>\n" +
+                     "You are a helpful assistant specializing in medical text annotation. Your task is to analyze the " +
+                     "provided outcome measure and outcome description from clinical trials and predict the most medically " +
+                     "significant biomarkers.\n" +
+
+                     "1) Output a comma-separated list of predicted biomarkers, using the format SUPERGROUP_name " +
+                     "(e.g., CSF_p-tau, BLOOD_Aβ40, FDG-PET). Do not include any additional commentary or explanation.\n" +
+
+                     "2) The biomarker list should follow the general format: SUPERGROUP_name. Example supergroups include " +
+                     "CSF, BLOOD, UD (undetermined), URINE, FDG-PET, fMRI, etc. This list is not exhaustive, and not all " +
+                     "terms must match the examples exactly.\n" +
+
+                     "3) If no specific biomarkers are clearly indicated, respond with a single word that best represents " +
+                     "the relevant biological domain (e.g., 'Metabolomics', 'Inflammation', 'Imaging').\n" +
+
+                     "4) If the outcome measure and description do not relate to any known biological processes or " +
+                     "biomarkers, respond with 'Unknown'.\n<</SYS>>" +
+
+                     f"\nOutcome Measure:\n{val1}\nOutcome Description:\n{val2}\n[/INST]\nBiomarkers: ")
+
     return prompt1
 
 prompt_A = format(OM1, OM2)
